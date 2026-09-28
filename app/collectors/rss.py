@@ -12,11 +12,12 @@ import ipaddress
 import os
 import re
 import socket
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional
+from typing import Callable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -24,13 +25,23 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_BACKOFF_SECONDS = 0.5
 USER_AGENT = "intel-board/0.2 (+https://github.com/sonwCode/intel-board)"
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 
 
 class FeedError(ValueError):
-    """A feed could not be fetched or parsed safely."""
+    """A feed could not be fetched or parsed safely.
+
+    ``retryable`` lets the ingestion layer retry transient network/server
+    failures without repeating deterministic XML or URL validation failures.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -241,9 +252,12 @@ def fetch_feed(
     except HTTPError as exc:
         if exc.code == 304:
             return FeedFetchResult([], etag, last_modified, True, 0)
-        raise FeedError(f"feed returned HTTP {exc.code}") from exc
+        raise FeedError(
+            f"feed returned HTTP {exc.code}",
+            retryable=exc.code in {408, 425, 429} or exc.code >= 500,
+        ) from exc
     except (URLError, TimeoutError, OSError) as exc:
-        raise FeedError(f"feed request failed: {exc}") from exc
+        raise FeedError(f"feed request failed: {exc}", retryable=True) from exc
 
     try:
         content_length = response.headers.get("Content-Length")
@@ -276,3 +290,40 @@ def fetch_feed(
         False,
         len(body),
     )
+
+
+def fetch_feed_with_retry(
+    url: str,
+    *,
+    etag: Optional[str] = None,
+    last_modified: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+    sleep=time.sleep,
+    fetcher: Callable[..., FeedFetchResult] = fetch_feed,
+) -> FeedFetchResult:
+    """Fetch a feed with bounded exponential backoff for transient failures."""
+    attempts = max(1, min(int(max_attempts), 5))
+    backoff = max(0.0, min(float(backoff_seconds), 30.0))
+    last_error: Optional[FeedError] = None
+    for attempt in range(attempts):
+        try:
+            return fetcher(
+                url,
+                etag=etag,
+                last_modified=last_modified,
+                timeout=timeout,
+                max_bytes=max_bytes,
+            )
+        except FeedError as exc:
+            last_error = exc
+            if not exc.retryable or attempt == attempts - 1:
+                raise
+            delay = min(backoff * (2**attempt), 30.0)
+            if delay:
+                sleep(delay)
+    # The loop either returns or raises. This keeps type checkers satisfied if
+    # a future change alters the loop bounds.
+    raise last_error or FeedError("feed request failed")

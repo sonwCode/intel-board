@@ -14,7 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
-from app.collectors.rss import FeedEntry, fetch_feed
+from app.collectors.rss import FeedEntry, fetch_feed, fetch_feed_with_retry
 
 
 def utc_now() -> str:
@@ -137,9 +137,10 @@ def _insert_entry(
             """
             INSERT INTO items
                 (slug, title, category, source, source_url, summary, content,
-                 risk_level, tags, status, published_at, expires_at, created_at,
-                 updated_at, source_id, document_id, dedupe_key, fetched_at)
-            VALUES (?, ?, 'intel', ?, ?, ?, ?, 'INFO', ?, 'published', ?, NULL, ?, ?, ?, ?, ?, ?)
+                 risk_level, tags, status, review_status, confidence, evidence_json,
+                 published_at, expires_at, created_at, updated_at, source_id,
+                 document_id, dedupe_key, fetched_at)
+            VALUES (?, ?, 'intel', ?, ?, ?, ?, 'INFO', ?, 'published', 'pending', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug,
@@ -149,6 +150,8 @@ def _insert_entry(
                 entry.summary,
                 entry.content,
                 json.dumps(["rss"], ensure_ascii=False),
+                0.6,
+                json.dumps([entry.content] if entry.content else [], ensure_ascii=False),
                 entry.published_at or fetched_at,
                 fetched_at,
                 fetched_at,
@@ -200,10 +203,14 @@ def sync_source(db: sqlite3.Connection, source: Mapping[str, Any]) -> dict[str, 
         )
 
     try:
-        result = fetch_feed(
+        result = fetch_feed_with_retry(
             str(source["url"]),
             etag=_value(source, "etag"),
             last_modified=_value(source, "last_modified"),
+            timeout=int(_value(source, "timeout_seconds", 15)),
+            max_attempts=int(_value(source, "max_attempts", 3)),
+            backoff_seconds=float(_value(source, "backoff_seconds", 0.5)),
+            fetcher=fetch_feed,
         )
         checked_at = utc_now()
         if result.not_modified:

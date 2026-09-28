@@ -68,3 +68,38 @@ def test_create_and_search_item(client: TestClient) -> None:
 
     duplicate = client.post("/api/items", json=item)
     assert duplicate.status_code == 409
+
+
+def test_review_fields_are_independent_from_risk_and_search_uses_fts(client: TestClient) -> None:
+    item = {
+        "slug": "reviewable-item",
+        "title": "全文检索目标条目",
+        "source": "pytest",
+        "summary": "可以通过全文检索找到",
+        "content": "原始证据片段",
+        "risk_level": "HIGH",
+        "review_status": "pending",
+        "confidence": 0.42,
+        "evidence": ["原始证据片段"],
+    }
+    created = client.post("/api/items", json=item)
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["review_status"] == "pending"
+    assert payload["confidence"] == 0.42
+    assert payload["evidence"] == ["原始证据片段"]
+
+    search = client.get("/api/items", params={"q": "全文检索目标"})
+    assert search.status_code == 200
+    assert search.json()["total"] == 1
+
+    reviewed = client.patch(
+        f"/api/items/{payload['id']}/review",
+        json={"review_status": "approved", "confidence": 0.9},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_status"] == "approved"
+    assert reviewed.json()["risk_level"] == "HIGH"
+
+    stats = client.get("/api/stats").json()
+    assert stats["by_review_status"]["approved"] >= 1

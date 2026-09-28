@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from app.ingestion import sync_source
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_DIR / "data" / "intel.db"
 DB_PATH = Path(os.getenv("INTEL_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
+_FTS_AVAILABLE: Optional[bool] = None
 
 
 def utc_now() -> str:
@@ -46,6 +48,67 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
+def _setup_items_fts(db: sqlite3.Connection) -> None:
+    """Create the optional SQLite FTS5 mirror and keep it in sync.
+
+    Some Python distributions are built without FTS5.  The dashboard still
+    works there through the existing ``LIKE`` fallback, so initialization must
+    remain successful when the extension is unavailable.
+    """
+    global _FTS_AVAILABLE
+    try:
+        db.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+                item_id UNINDEXED,
+                title,
+                summary,
+                content,
+                source,
+                tags
+            )
+            """
+        )
+        db.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS items_fts_after_insert
+            AFTER INSERT ON items BEGIN
+                INSERT INTO items_fts(rowid, item_id, title, summary, content, source, tags)
+                VALUES (new.id, new.id, new.title, new.summary, new.content, new.source, new.tags);
+            END;
+            CREATE TRIGGER IF NOT EXISTS items_fts_after_update
+            AFTER UPDATE OF title, summary, content, source, tags ON items BEGIN
+                DELETE FROM items_fts WHERE rowid = old.id;
+                INSERT INTO items_fts(rowid, item_id, title, summary, content, source, tags)
+                VALUES (new.id, new.id, new.title, new.summary, new.content, new.source, new.tags);
+            END;
+            CREATE TRIGGER IF NOT EXISTS items_fts_after_delete
+            AFTER DELETE ON items BEGIN
+                DELETE FROM items_fts WHERE rowid = old.id;
+            END;
+            """
+        )
+        item_count = db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        fts_count = db.execute("SELECT COUNT(*) FROM items_fts").fetchone()[0]
+        if item_count != fts_count:
+            db.execute("DELETE FROM items_fts")
+            db.execute(
+                """
+                INSERT INTO items_fts(rowid, item_id, title, summary, content, source, tags)
+                SELECT id, id, title, summary, content, source, tags FROM items
+                """
+            )
+        _FTS_AVAILABLE = True
+    except sqlite3.OperationalError:
+        _FTS_AVAILABLE = False
+
+
+def _fts_query(value: str) -> str:
+    """Turn free text into a conservative FTS5 prefix query."""
+    terms = re.findall(r"[\w\u4e00-\u9fff]+", value, flags=re.UNICODE)
+    return " AND ".join('"' + term.replace('"', '""') + '"*' for term in terms)
+
+
 def init_db() -> None:
     with get_db() as db:
         db.executescript(
@@ -62,6 +125,9 @@ def init_db() -> None:
                 risk_level TEXT NOT NULL DEFAULT 'INFO',
                 tags TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'published',
+                review_status TEXT NOT NULL DEFAULT 'approved',
+                confidence REAL NOT NULL DEFAULT 0.8,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
                 published_at TEXT NOT NULL,
                 expires_at TEXT,
                 created_at TEXT NOT NULL,
@@ -102,6 +168,9 @@ def init_db() -> None:
                 last_checked_at TEXT,
                 last_success_at TEXT,
                 last_error TEXT,
+                timeout_seconds INTEGER NOT NULL DEFAULT 15,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                backoff_seconds REAL NOT NULL DEFAULT 0.5,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -149,16 +218,41 @@ def init_db() -> None:
             "document_id": "ALTER TABLE items ADD COLUMN document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL",
             "dedupe_key": "ALTER TABLE items ADD COLUMN dedupe_key TEXT",
             "fetched_at": "ALTER TABLE items ADD COLUMN fetched_at TEXT",
+            "review_status": "ALTER TABLE items ADD COLUMN review_status TEXT NOT NULL DEFAULT 'approved'",
+            "confidence": "ALTER TABLE items ADD COLUMN confidence REAL NOT NULL DEFAULT 0.8",
+            "evidence_json": "ALTER TABLE items ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
         }
+        review_status_was_added = "review_status" not in existing_columns
         for column, statement in migrations.items():
             if column not in existing_columns:
                 db.execute(statement)
+        if review_status_was_added:
+            # Preserve the old compatibility behavior for legacy high-risk
+            # demo/hand-entered rows while keeping the field independent from
+            # risk for all subsequent updates.
+            db.execute(
+                "UPDATE items SET review_status = 'pending' "
+                "WHERE risk_level IN ('HIGH', 'CRITICAL') AND status = 'published'"
+            )
         db.execute("CREATE INDEX IF NOT EXISTS idx_items_source_id ON items(source_id)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_items_document_id ON items(document_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_items_review_status ON items(review_status)")
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_items_dedupe_key "
             "ON items(dedupe_key) WHERE dedupe_key IS NOT NULL"
         )
+        source_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(sources)").fetchall()
+        }
+        source_migrations = {
+            "timeout_seconds": "ALTER TABLE sources ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 15",
+            "max_attempts": "ALTER TABLE sources ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+            "backoff_seconds": "ALTER TABLE sources ADD COLUMN backoff_seconds REAL NOT NULL DEFAULT 0.5",
+        }
+        for column, statement in source_migrations.items():
+            if column not in source_columns:
+                db.execute(statement)
+        _setup_items_fts(db)
 
 
 def seed_demo_data() -> None:
@@ -240,12 +334,16 @@ def seed_demo_data() -> None:
                 """
                 INSERT INTO items
                     (slug, title, category, source, source_url, summary, content,
-                     risk_level, tags, status, published_at, expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?)
+                     risk_level, tags, status, review_status, confidence, evidence_json,
+                     published_at, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["slug"], item["title"], item["category"], item["source"], item["source_url"],
                     item["summary"], item["content"], item["risk_level"], json.dumps(item["tags"], ensure_ascii=False),
+                    "pending" if item["risk_level"] in {"HIGH", "CRITICAL"} else "approved",
+                    0.58 if item["risk_level"] == "HIGH" else 0.88,
+                    json.dumps([item["content"]] if item["content"] else [], ensure_ascii=False),
                     item["published_at"], item["expires_at"], now, now,
                 ),
             )
@@ -289,6 +387,9 @@ class ItemCreate(BaseModel):
     summary: str = ""
     content: str = ""
     risk_level: str = Field(default="INFO", max_length=20)
+    review_status: Literal["pending", "approved", "rejected"] = "pending"
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list, max_length=20)
     tags: list[str] = Field(default_factory=list)
     published_at: Optional[str] = None
     expires_at: Optional[str] = None
@@ -303,6 +404,14 @@ class ItemOut(ItemCreate):
     document_id: Optional[int] = None
     dedupe_key: Optional[str] = None
     fetched_at: Optional[str] = None
+
+
+class ReviewUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_status: Literal["pending", "approved", "rejected"]
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    evidence: Optional[list[str]] = Field(default=None, max_length=20)
 
 
 class ReportOut(BaseModel):
@@ -326,6 +435,9 @@ class SourceCreate(BaseModel):
     kind: Literal["rss", "atom", "auto"] = "rss"
     url: str = Field(min_length=1, max_length=2000)
     enabled: bool = True
+    timeout_seconds: int = Field(default=15, ge=1, le=120)
+    max_attempts: int = Field(default=3, ge=1, le=5)
+    backoff_seconds: float = Field(default=0.5, ge=0.0, le=30.0)
 
 
 class SourceOut(BaseModel):
@@ -341,6 +453,9 @@ class SourceOut(BaseModel):
     last_checked_at: Optional[str] = None
     last_success_at: Optional[str] = None
     last_error: Optional[str] = None
+    timeout_seconds: int
+    max_attempts: int
+    backoff_seconds: float
     created_at: str
     updated_at: str
 
@@ -365,6 +480,11 @@ def item_from_row(row: sqlite3.Row) -> dict[str, Any]:
         result["tags"] = json.loads(result.get("tags") or "[]")
     except json.JSONDecodeError:
         result["tags"] = []
+    evidence_raw = result.pop("evidence_json", "[]")
+    try:
+        result["evidence"] = json.loads(evidence_raw or "[]")
+    except json.JSONDecodeError:
+        result["evidence"] = []
     return result
 
 
@@ -467,10 +587,22 @@ def create_source(payload: SourceCreate) -> dict[str, Any]:
         with get_db() as db:
             cursor = db.execute(
                 """
-                INSERT INTO sources (name, kind, url, enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO sources
+                    (name, kind, url, enabled, timeout_seconds, max_attempts,
+                     backoff_seconds, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, payload.kind, canonical_url, int(payload.enabled), now, now),
+                (
+                    name,
+                    payload.kind,
+                    canonical_url,
+                    int(payload.enabled),
+                    payload.timeout_seconds,
+                    payload.max_attempts,
+                    payload.backoff_seconds,
+                    now,
+                    now,
+                ),
             )
             row = db.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
     except sqlite3.IntegrityError as exc:
@@ -539,15 +671,21 @@ def list_items(
     source: Optional[str] = Query(default=None),
     tag: Optional[str] = Query(default=None),
     status: str = Query(default="published"),
+    review_status: Optional[str] = Query(default=None, max_length=20),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     clauses = ["status = ?"]
     params: list[Any] = [status]
     if q:
-        clauses.append("(title LIKE ? OR summary LIKE ? OR content LIKE ? OR source LIKE ?)")
-        needle = f"%{q}%"
-        params.extend([needle, needle, needle, needle])
+        fts_term = _fts_query(q)
+        if _FTS_AVAILABLE and fts_term:
+            clauses.append("id IN (SELECT item_id FROM items_fts WHERE items_fts MATCH ?)")
+            params.append(fts_term)
+        else:
+            clauses.append("(title LIKE ? OR summary LIKE ? OR content LIKE ? OR source LIKE ?)")
+            needle = f"%{q}%"
+            params.extend([needle, needle, needle, needle])
     if category:
         clauses.append("category = ?")
         params.append(category)
@@ -560,6 +698,9 @@ def list_items(
     if tag:
         clauses.append("tags LIKE ?")
         params.append(f'%"{tag}%"%')
+    if review_status:
+        clauses.append("review_status = ?")
+        params.append(review_status)
     where = " AND ".join(clauses)
     with get_db() as db:
         total = db.execute(f"SELECT COUNT(*) FROM items WHERE {where}", params).fetchone()[0]
@@ -579,23 +720,60 @@ def get_item(item_id: int) -> dict[str, Any]:
     return item_from_row(row)
 
 
+@app.patch("/api/items/{item_id}/review", response_model=ItemOut)
+def update_item_review(item_id: int, payload: ReviewUpdate) -> dict[str, Any]:
+    with get_db() as db:
+        current = db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="item not found")
+        evidence = payload.evidence
+        if evidence is None:
+            try:
+                evidence = json.loads(current["evidence_json"] or "[]")
+            except json.JSONDecodeError:
+                evidence = []
+        confidence = payload.confidence
+        if confidence is None:
+            confidence = float(current["confidence"] or 0.0)
+        db.execute(
+            """
+            UPDATE items
+            SET review_status = ?, confidence = ?, evidence_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                payload.review_status,
+                confidence,
+                json.dumps(evidence, ensure_ascii=False),
+                utc_now(),
+                item_id,
+            ),
+        )
+        row = db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    return item_from_row(row)
+
+
 @app.post("/api/items", response_model=ItemOut, status_code=201)
 def create_item(payload: ItemCreate) -> dict[str, Any]:
     now = utc_now()
     published_at = payload.published_at or now
+    evidence = payload.evidence or ([payload.content] if payload.content else [])
     try:
         with get_db() as db:
             cursor = db.execute(
                 """
                 INSERT INTO items
                     (slug, title, category, source, source_url, summary, content,
-                     risk_level, tags, status, published_at, expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?)
+                     risk_level, tags, status, review_status, confidence, evidence_json,
+                     published_at, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload.slug, payload.title, payload.category, payload.source, payload.source_url,
                     payload.summary, payload.content, payload.risk_level.upper(),
-                    json.dumps(payload.tags, ensure_ascii=False), published_at, payload.expires_at, now, now,
+                    json.dumps(payload.tags, ensure_ascii=False), payload.review_status,
+                    payload.confidence, json.dumps(evidence, ensure_ascii=False),
+                    published_at, payload.expires_at, now, now,
                 ),
             )
             item_id = cursor.lastrowid
@@ -668,7 +846,15 @@ def latest_report_items(limit: int = Query(default=50, ge=1, le=100)) -> dict[st
 def claim_from_item(item: dict[str, Any]) -> dict[str, Any]:
     """Adapt the storage model to the small claim shape used by the bundled UI."""
     risk = str(item.get("risk_level", "INFO")).lower()
-    confidence = {"low": 0.92, "medium": 0.78, "high": 0.58, "info": 0.88}.get(risk, 0.70)
+    fallback_confidence = {"low": 0.92, "medium": 0.78, "high": 0.58, "info": 0.88}.get(risk, 0.70)
+    try:
+        confidence = float(item.get("confidence", fallback_confidence))
+    except (TypeError, ValueError):
+        confidence = fallback_confidence
+    review_status = str(item.get("review_status") or ("pending" if risk in {"high", "critical"} else "approved"))
+    evidence = item.get("evidence") or item.get("content", "")
+    if isinstance(evidence, list):
+        evidence = "\n".join(str(part) for part in evidence)
     return {
         "id": item["id"],
         "title": item["title"],
@@ -676,10 +862,11 @@ def claim_from_item(item: dict[str, Any]) -> dict[str, Any]:
         "benefit": item.get("summary", ""),
         "conditions": item.get("tags", []),
         "risk_level": risk,
-        "status": "pending" if risk in {"high", "critical"} else "approved",
+        "status": review_status,
+        "review_status": review_status,
         "confidence": confidence,
         "source_url": item.get("source_url"),
-        "evidence": item.get("content", ""),
+        "evidence": evidence,
         "published_at": item.get("published_at", ""),
         "source": item.get("source", ""),
     }
@@ -704,6 +891,7 @@ def list_claims(
         source=None,
         tag=None,
         status="published",
+        review_status=None,
         limit=100,
         offset=0,
     )
@@ -750,7 +938,8 @@ def stats() -> dict[str, Any]:
     with get_db() as db:
         by_category = {row["category"]: row["count"] for row in db.execute("SELECT category, COUNT(*) AS count FROM items GROUP BY category")}
         by_risk = {row["risk_level"]: row["count"] for row in db.execute("SELECT risk_level, COUNT(*) AS count FROM items GROUP BY risk_level")}
-    return {"by_category": by_category, "by_risk_level": by_risk}
+        by_review_status = {row["review_status"]: row["count"] for row in db.execute("SELECT review_status, COUNT(*) AS count FROM items GROUP BY review_status")}
+    return {"by_category": by_category, "by_risk_level": by_risk, "by_review_status": by_review_status}
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ function normalizeItem(item) {
   return { ...item, category:item.category || 'intel', benefit:item.benefit || item.summary || item.content || '', evidence:item.evidence || item.content || item.summary || '暂无证据', conditions:item.conditions || item.tags || [], risk_level:risk, status:item.status || 'published', confidence:item.confidence ?? (risk==='high' ? .72 : .86) };
 }
 function riskText(r) { return ({low:'低风险',medium:'中风险',high:'高风险',info:'提示'})[r] || r; }
-function statusText(s) { return s === 'published' ? '已发布' : (s === 'approved' ? '已审核' : s || '待处理'); }
+function statusText(s) { return ({published:'已发布', approved:'已审核', pending:'待处理', rejected:'已拒绝'})[s] || s || '待处理'; }
 function renderStats() {
   const claims = state.claims;
   $('statTotal').textContent = claims.length;
@@ -114,7 +114,23 @@ function renderClaims() {
       <p class="meta">标签/条件：${escapeHtml((c.conditions || []).join('、') || '未注明')}</p>
       <p class="evidence">证据：${escapeHtml(c.evidence || '暂无证据')}</p>
       <p class="meta"><a href="${escapeHtml(c.source_url || '#')}" target="_blank" rel="noreferrer">${escapeHtml(c.source_url || '无来源')}</a></p>
+      ${c.status === 'pending' ? `<div class="claim-actions"><button class="button secondary review-action" data-review-status="approved" data-item-id="${c.id}">通过审核</button><button class="button danger review-action" data-review-status="rejected" data-item-id="${c.id}">驳回</button></div>` : ''}
     </article>`).join('');
+  root.querySelectorAll('.review-action').forEach(button => button.addEventListener('click', () => updateReview(Number(button.dataset.itemId), button.dataset.reviewStatus)));
+}
+async function updateReview(itemId, reviewStatus) {
+  try {
+    const response = await fetch(`/api/items/${itemId}/review`, {
+      method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({review_status:reviewStatus})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || '审核更新失败');
+    await loadClaims();
+  } catch (error) {
+    window.alert(error.message || '审核更新失败');
+  }
 }
 function applyFilters() {
   const q = $('searchInput').value.trim().toLowerCase();

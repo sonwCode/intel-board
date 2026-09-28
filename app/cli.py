@@ -31,10 +31,22 @@ def source_add(args: argparse.Namespace) -> int:
         with get_db() as db:
             cursor = db.execute(
                 """
-                INSERT INTO sources (name, kind, url, enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO sources
+                    (name, kind, url, enabled, timeout_seconds, max_attempts,
+                     backoff_seconds, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, args.kind, canonical_url, int(not args.disabled), now, now),
+                (
+                    name,
+                    args.kind,
+                    canonical_url,
+                    int(not args.disabled),
+                    max(1, min(args.timeout_seconds, 120)),
+                    max(1, min(args.max_attempts, 5)),
+                    max(0.0, min(args.backoff_seconds, 30.0)),
+                    now,
+                    now,
+                ),
             )
             row = db.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
     except sqlite3.IntegrityError as exc:
@@ -77,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--url", required=True, help="RSS/Atom 地址")
     add.add_argument("--kind", choices=("rss", "atom", "auto"), default="rss")
     add.add_argument("--disabled", action="store_true", help="创建后暂不启用")
+    add.add_argument("--timeout-seconds", type=int, default=15, help="单次请求超时，默认 15 秒")
+    add.add_argument("--max-attempts", type=int, default=3, help="瞬时失败最大尝试次数，默认 3 次")
+    add.add_argument("--backoff-seconds", type=float, default=0.5, help="重试初始退避秒数，默认 0.5")
     add.set_defaults(handler=source_add)
 
     listing = subparsers.add_parser("source-list", help="列出来源")

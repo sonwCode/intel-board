@@ -133,3 +133,44 @@ def test_fetch_feed_handles_304(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.not_modified is True
     assert result.entries == []
     assert result.etag == '"v1"'
+
+
+def test_fetch_feed_with_retry_retries_only_transient_errors() -> None:
+    calls: list[int] = []
+    delays: list[float] = []
+    result = rss.FeedFetchResult([], '"v2"', None, False, 0)
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise rss.FeedError("temporary outage", retryable=True)
+        return result
+
+    actual = rss.fetch_feed_with_retry(
+        "http://93.184.216.34/feed.xml",
+        max_attempts=3,
+        backoff_seconds=0.25,
+        sleep=delays.append,
+        fetcher=flaky,
+    )
+
+    assert actual is result
+    assert len(calls) == 2
+    assert delays == [0.25]
+
+
+def test_fetch_feed_with_retry_does_not_repeat_parse_errors() -> None:
+    calls: list[int] = []
+
+    def invalid(*args, **kwargs):
+        calls.append(1)
+        raise rss.FeedError("invalid XML")
+
+    with pytest.raises(rss.FeedError):
+        rss.fetch_feed_with_retry(
+            "http://93.184.216.34/feed.xml",
+            max_attempts=3,
+            sleep=lambda _: None,
+            fetcher=invalid,
+        )
+    assert calls == [1]

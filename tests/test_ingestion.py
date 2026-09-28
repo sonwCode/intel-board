@@ -40,6 +40,7 @@ def test_source_sync_inserts_once_and_skips_duplicates(
         json={"name": "Example feed", "url": "https://93.184.216.34/feed.xml", "kind": "rss"},
     )
     assert created.status_code == 201
+    assert created.json()["max_attempts"] == 3
     source_id = created.json()["id"]
     result = FeedFetchResult([_entry(1), _entry(2)], '"v1"', "now", False, 128)
     monkeypatch.setattr(ingestion, "fetch_feed", lambda *args, **kwargs: result)
@@ -58,6 +59,36 @@ def test_source_sync_inserts_once_and_skips_duplicates(
     assert items["total"] == 2
     documents = client.get("/api/ingestion/runs", params={"source_id": source_id}).json()
     assert documents["total"] == 2
+
+
+def test_source_sync_retries_transient_fetch_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = client.post(
+        "/api/sources",
+        json={
+            "name": "Retry feed",
+            "url": "https://93.184.216.34/retry.xml",
+            "max_attempts": 2,
+            "backoff_seconds": 0,
+        },
+    )
+    source_id = created.json()["id"]
+    calls: list[int] = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise FeedError("temporary outage", retryable=True)
+        return FeedFetchResult([_entry(3)], '"retry"', None, False, 64)
+
+    monkeypatch.setattr(ingestion, "fetch_feed", flaky)
+    response = client.post(f"/api/sources/{source_id}/sync")
+
+    assert response.status_code == 200
+    assert response.json()["run"]["status"] == "success"
+    assert response.json()["run"]["inserted_count"] == 1
+    assert len(calls) == 2
 
 
 def test_not_modified_creates_audit_run_without_new_items(
