@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>今日情报看板</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">LOCAL INTELLIGENCE WORKBENCH</p>
+        <h1>今日情报看板</h1>
+        <p class="subtitle">把来源、证据、判断和报告放进一条可追溯的流水线。</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn" class="button primary">刷新数据</button>
+        <button id="reportBtn" class="button secondary">生成今日报告</button>
+      </div>
+    </header>
+
+    <section class="stats" aria-label="统计">
+      <article class="stat-card"><span>记录总数</span><strong id="statTotal">—</strong></article>
+      <article class="stat-card"><span>已审核</span><strong id="statApproved">—</strong></article>
+      <article class="stat-card"><span>待处理</span><strong id="statPending">—</strong></article>
+      <article class="stat-card"><span>高风险提示</span><strong id="statHighRisk">—</strong></article>
+    </section>
+
+    <section class="workspace">
+      <div class="panel filters-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">CLAIMS</p><h2>结构化情报</h2></div>
+          <span id="resultCount" class="muted">—</span>
+        </div>
+        <div class="filters">
+          <label>关键词<input id="searchInput" type="search" placeholder="标题、证据或来源" /></label>
+          <label>分类<select id="categorySelect"><option value="">全部分类</option></select></label>
+          <label>状态<select id="statusSelect"><option value="">全部状态</option><option value="approved">已审核</option><option value="pending">待处理</option></select></label>
+          <label>风险<select id="riskSelect"><option value="">全部风险</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
+        </div>
+      </div>
+
+      <div id="claims" class="claims" aria-live="polite"></div>
+
+      <aside class="panel report-panel">
+        <div class="panel-heading"><div><p class="eyebrow">REPORT</p><h2>今日报告</h2></div><span id="reportDate" class="muted"></span></div>
+        <pre id="reportBody" class="report-body">点击“生成今日报告”查看 Markdown 报告。</pre>
+      </aside>
+    </section>
+
+    <footer class="footer"><span>本地模板 · 数据默认保存在 SQLite</span><span id="lastUpdated">未加载</span></footer>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
