@@ -12,13 +12,16 @@ import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Literal, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.collectors.rss import FeedError, validate_feed_url
+from app.ingestion import sync_source
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -87,7 +90,74 @@ def init_db() -> None:
                 position INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (report_id, item_id)
             );
+
+            CREATE TABLE IF NOT EXISTS sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'rss',
+                url TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                etag TEXT,
+                last_modified TEXT,
+                last_checked_at TEXT,
+                last_success_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
+            CREATE INDEX IF NOT EXISTS idx_sources_last_checked ON sources(last_checked_at);
+
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                external_id TEXT NOT NULL,
+                canonical_url TEXT,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                published_at TEXT,
+                fingerprint TEXT NOT NULL,
+                fetched_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_id);
+            CREATE INDEX IF NOT EXISTS idx_documents_external_id ON documents(external_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_fingerprint ON documents(fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_documents_canonical_url ON documents(canonical_url);
+
+            CREATE TABLE IF NOT EXISTS ingestion_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                fetched_count INTEGER NOT NULL DEFAULT 0,
+                inserted_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source ON ingestion_runs(source_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_ingestion_runs_status ON ingestion_runs(status);
             """
+        )
+        # The template shipped before source ingestion was added. Keep old
+        # databases usable by adding nullable linkage columns in place.
+        existing_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(items)").fetchall()
+        }
+        migrations = {
+            "source_id": "ALTER TABLE items ADD COLUMN source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL",
+            "document_id": "ALTER TABLE items ADD COLUMN document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL",
+            "dedupe_key": "ALTER TABLE items ADD COLUMN dedupe_key TEXT",
+            "fetched_at": "ALTER TABLE items ADD COLUMN fetched_at TEXT",
+        }
+        for column, statement in migrations.items():
+            if column not in existing_columns:
+                db.execute(statement)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_items_source_id ON items(source_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_items_document_id ON items(document_id)")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_items_dedupe_key "
+            "ON items(dedupe_key) WHERE dedupe_key IS NOT NULL"
         )
 
 
@@ -229,6 +299,10 @@ class ItemOut(ItemCreate):
     status: str
     created_at: str
     updated_at: str
+    source_id: Optional[int] = None
+    document_id: Optional[int] = None
+    dedupe_key: Optional[str] = None
+    fetched_at: Optional[str] = None
 
 
 class ReportOut(BaseModel):
@@ -243,6 +317,46 @@ class ReportOut(BaseModel):
     created_at: str
     updated_at: str
     item_ids: list[int] = Field(default_factory=list)
+
+
+class SourceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    kind: Literal["rss", "atom", "auto"] = "rss"
+    url: str = Field(min_length=1, max_length=2000)
+    enabled: bool = True
+
+
+class SourceOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    name: str
+    kind: str
+    url: str
+    enabled: bool
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+    last_checked_at: Optional[str] = None
+    last_success_at: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class IngestionRunOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    source_id: int
+    status: str
+    started_at: str
+    finished_at: Optional[str] = None
+    fetched_count: int
+    inserted_count: int
+    skipped_count: int
+    error: Optional[str] = None
 
 
 def item_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -260,6 +374,16 @@ def report_from_row(row: sqlite3.Row, item_ids: Optional[list[int]] = None) -> d
     return result
 
 
+def source_from_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result["enabled"] = bool(result.get("enabled", 0))
+    return result
+
+
+def ingestion_run_from_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    return dict(row)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -269,7 +393,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Info Intel Dashboard API",
-    version="0.1.0",
+    version="0.2.0",
     description="本地情报/优惠信息看板的最小可运行后端模板。",
     lifespan=lifespan,
 )
@@ -301,6 +425,110 @@ def health() -> dict[str, Any]:
         item_count = db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         report_count = db.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
     return {"ok": True, "service": "info-intel-dashboard", "items": item_count, "reports": report_count}
+
+
+@app.get("/api/sources")
+def list_sources(
+    enabled: Optional[bool] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if enabled is not None:
+        clauses.append("enabled = ?")
+        params.append(int(enabled))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_db() as db:
+        total = db.execute(f"SELECT COUNT(*) FROM sources {where}", params).fetchone()[0]
+        rows = db.execute(
+            f"SELECT * FROM sources {where} ORDER BY name COLLATE NOCASE, id LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "sources": [source_from_row(row) for row in rows],
+    }
+
+
+@app.post("/api/sources", response_model=SourceOut, status_code=201)
+def create_source(payload: SourceCreate) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="source name cannot be blank")
+    try:
+        canonical_url = validate_feed_url(payload.url, resolve_dns=False)
+    except FeedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    now = utc_now()
+    try:
+        with get_db() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO sources (name, kind, url, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (name, payload.kind, canonical_url, int(payload.enabled), now, now),
+            )
+            row = db.execute("SELECT * FROM sources WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="source URL already exists") from exc
+    return source_from_row(row)
+
+
+@app.get("/api/sources/{source_id}", response_model=SourceOut)
+def get_source(source_id: int) -> dict[str, Any]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    return source_from_row(row)
+
+
+@app.post("/api/sources/{source_id}/sync")
+def sync_source_endpoint(source_id: int) -> dict[str, Any]:
+    with get_db() as db:
+        source = db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+        if source is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        run = sync_source(db, source)
+        refreshed_source = db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    return {
+        "source": source_from_row(refreshed_source),
+        "run": run,
+    }
+
+
+@app.get("/api/ingestion/runs")
+def list_ingestion_runs(
+    source_id: Optional[int] = Query(default=None, ge=1),
+    status: Optional[str] = Query(default=None, max_length=30),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if source_id is not None:
+        clauses.append("source_id = ?")
+        params.append(source_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_db() as db:
+        total = db.execute(f"SELECT COUNT(*) FROM ingestion_runs {where}", params).fetchone()[0]
+        rows = db.execute(
+            f"SELECT * FROM ingestion_runs {where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "runs": [ingestion_run_from_row(row) for row in rows],
+    }
 
 
 @app.get("/api/items")

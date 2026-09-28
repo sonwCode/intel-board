@@ -1,4 +1,4 @@
-const state = { claims: [], filtered: [] };
+const state = { claims: [], filtered: [], sources: [] };
 const demoClaims = [
   {id:1,title:'Gemini API 开发者额度',category:'deal',benefit:'新开发者可获得试用额度，适合原型测试。',conditions:['需要开发者账号'],risk_level:'low',status:'published',confidence:.92,source_url:'https://ai.google.dev/',evidence:'官方文档说明新账号可使用试用额度。',published_at:'2026-09-28'},
   {id:2,title:'开源 CLI 版本更新',category:'tech',benefit:'修复连接失败和 JSON 解析异常。',conditions:['升级到最新版本'],risk_level:'low',status:'published',confidence:.88,source_url:'https://github.com/',evidence:'发布说明列出连接稳定性和解析修复。',published_at:'2026-09-28'},
@@ -25,6 +25,82 @@ function renderCategories() {
   const cats = [...new Set(state.claims.map(c=>c.category).filter(Boolean))].sort();
   $('categorySelect').innerHTML = '<option value="">全部分类</option>' + cats.map(c=>`<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
   $('categorySelect').value = cats.includes(current) ? current : '';
+}
+function sourceStatus(source) {
+  if (source.last_error) return `失败：${source.last_error}`;
+  if (source.last_success_at) return `最近成功：${source.last_success_at}`;
+  return '尚未同步';
+}
+function renderSources() {
+  const root = $('sources');
+  if (!root) return;
+  if (!state.sources.length) {
+    root.innerHTML = '<div class="empty source-empty">还没有配置来源。添加一个 RSS / Atom 地址后即可手动同步。</div>';
+    return;
+  }
+  root.innerHTML = state.sources.map(source => `
+    <article class="source-row">
+      <div class="source-info">
+        <strong>${escapeHtml(source.name)}</strong>
+        <a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(source.url)}</a>
+        <span class="meta">${escapeHtml(source.kind.toUpperCase())} · ${escapeHtml(sourceStatus(source))}</span>
+      </div>
+      <button class="button secondary sync-source" data-source-id="${source.id}" ${source.enabled ? '' : 'disabled'}>${source.enabled ? '立即同步' : '已停用'}</button>
+    </article>`).join('');
+  root.querySelectorAll('.sync-source').forEach(button => button.addEventListener('click', () => syncSource(Number(button.dataset.sourceId))));
+}
+async function loadSources() {
+  try {
+    const response = await fetch('/api/sources');
+    if (!response.ok) throw new Error('source API unavailable');
+    const data = await response.json();
+    state.sources = Array.isArray(data) ? data : (data.sources || []);
+  } catch (_) {
+    state.sources = [];
+  }
+  renderSources();
+}
+async function createSource(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const message = $('sourceMessage');
+  const formData = new FormData(form);
+  const payload = {
+    name: String(formData.get('name') || '').trim(),
+    url: String(formData.get('url') || '').trim(),
+    kind: String(formData.get('kind') || 'rss')
+  };
+  message.className = 'form-message';
+  message.textContent = '添加中…';
+  try {
+    const response = await fetch('/api/sources', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || '添加失败');
+    message.className = 'form-message success';
+    message.textContent = '来源已添加。';
+    form.reset();
+    await loadSources();
+  } catch (error) {
+    message.className = 'form-message error';
+    message.textContent = error.message || '添加失败，请检查地址。';
+  }
+}
+async function syncSource(sourceId) {
+  const message = $('sourceMessage');
+  message.className = 'form-message';
+  message.textContent = '同步中…';
+  try {
+    const response = await fetch(`/api/sources/${sourceId}/sync`, {method:'POST'});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || '同步失败');
+    const run = data.run || {};
+    message.className = run.status === 'failed' ? 'form-message error' : 'form-message success';
+    message.textContent = run.status === 'failed' ? (run.error || '同步失败') : `同步完成：新增 ${run.inserted_count || 0} 条，跳过 ${run.skipped_count || 0} 条。`;
+    await Promise.all([loadSources(), loadClaims()]);
+  } catch (error) {
+    message.className = 'form-message error';
+    message.textContent = error.message || '同步失败。';
+  }
 }
 function renderClaims() {
   const root = $('claims');
@@ -116,10 +192,13 @@ async function createItem(event) {
     message.textContent = error.message || '保存失败，请检查服务是否启动。';
   }
 }
-$('refreshBtn').addEventListener('click', loadClaims);
+async function refreshAll() { await Promise.all([loadClaims(), loadSources()]); }
+$('refreshBtn').addEventListener('click', refreshAll);
 $('reportBtn').addEventListener('click', generateReport);
 if ($('itemForm')) $('itemForm').addEventListener('submit', createItem);
+if ($('sourceForm')) $('sourceForm').addEventListener('submit', createSource);
 ['searchInput','categorySelect','statusSelect','riskSelect'].forEach(id => $(id).addEventListener('input', applyFilters));
 loadClaims();
+loadSources();
 
 

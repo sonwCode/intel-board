@@ -41,6 +41,23 @@
         </div>
       </div>
 
+      <details class="panel sources-panel">
+        <summary>
+          <span><span class="eyebrow">SOURCES</span><strong>采集来源</strong></span>
+          <span class="muted">添加 RSS / Atom 并手动同步</span>
+        </summary>
+        <div class="sources-content">
+          <form id="sourceForm" class="source-form">
+            <label>名称<input name="name" required maxlength="120" placeholder="例如：官方博客" /></label>
+            <label>Feed URL<input name="url" type="url" required maxlength="2000" placeholder="https://example.com/feed.xml" /></label>
+            <label>类型<select name="kind"><option value="rss">RSS</option><option value="atom">Atom</option><option value="auto">自动识别</option></select></label>
+            <button class="button primary" type="submit">添加来源</button>
+          </form>
+          <p id="sourceMessage" class="form-message" role="status"></p>
+          <div id="sources" class="source-list" aria-live="polite"></div>
+        </div>
+      </details>
+
       <details class="panel intake-panel">
         <summary>
           <span><span class="eyebrow">INTAKE</span><strong>录入一条情报</strong></span>
