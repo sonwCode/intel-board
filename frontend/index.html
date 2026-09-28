@@ -41,6 +41,26 @@
         </div>
       </div>
 
+      <details class="panel intake-panel">
+        <summary>
+          <span><span class="eyebrow">INTAKE</span><strong>录入一条情报</strong></span>
+          <span class="muted">保存来源、摘要和证据</span>
+        </summary>
+        <form id="itemForm" class="intake-form">
+          <div class="form-grid">
+            <label>标题 *<input name="title" required maxlength="240" placeholder="例如：某服务发布新的试用额度" /></label>
+            <label>来源 *<input name="source" required maxlength="120" placeholder="官方公告 / GitHub / 社区" /></label>
+            <label>分类<select name="category"><option value="deal">优惠 / 额度</option><option value="tech">技术动态</option><option value="alert">风险提示</option><option value="intel">其他情报</option></select></label>
+            <label>风险<select name="risk_level"><option value="INFO">提示</option><option value="LOW">低</option><option value="MEDIUM">中</option><option value="HIGH">高</option></select></label>
+            <label class="wide">来源链接<input name="source_url" type="url" placeholder="https://..." /></label>
+            <label>标签（逗号分隔）<input name="tags" placeholder="API, 额度, 开发者" /></label>
+            <label class="wide">摘要 *<textarea name="summary" required maxlength="1000" rows="2" placeholder="用一句话说明这条信息是什么。"></textarea></label>
+            <label class="wide">证据 / 原文片段 *<textarea name="content" required maxlength="10000" rows="4" placeholder="保留能支持判断的原文片段，方便之后追溯。"></textarea></label>
+          </div>
+          <div class="form-actions"><button class="button primary" type="submit">保存情报</button><span id="formMessage" class="form-message" role="status"></span></div>
+        </form>
+      </details>
+
       <div id="claims" class="claims" aria-live="polite"></div>
 
       <aside class="panel report-panel">

@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, (c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c])); }
 function normalizeItem(item) {
   const risk = String(item.risk_level || 'INFO').toLowerCase();
-  return { ...item, category:item.category || 'intel', benefit:item.summary || item.content || '', evidence:item.content || item.summary || '暂无证据', conditions:item.tags || [], risk_level:risk, status:item.status || 'published', confidence:item.confidence ?? (risk==='high' ? .72 : .86) };
+  return { ...item, category:item.category || 'intel', benefit:item.benefit || item.summary || item.content || '', evidence:item.evidence || item.content || item.summary || '暂无证据', conditions:item.conditions || item.tags || [], risk_level:risk, status:item.status || 'published', confidence:item.confidence ?? (risk==='high' ? .72 : .86) };
 }
 function riskText(r) { return ({low:'低风险',medium:'中风险',high:'高风险',info:'提示'})[r] || r; }
 function statusText(s) { return s === 'published' ? '已发布' : (s === 'approved' ? '已审核' : s || '待处理'); }
@@ -55,10 +55,10 @@ function applyFilters() {
 async function loadClaims() {
   $('lastUpdated').textContent = '加载中…';
   try {
-    const response = await fetch('/api/items?limit=100');
+    const response = await fetch('/api/claims');
     if (!response.ok) throw new Error('API unavailable');
     const data = await response.json();
-    state.claims = (data.items || []).map(normalizeItem);
+    state.claims = (Array.isArray(data) ? data : []).map(normalizeItem);
   } catch (_) {
     state.claims = demoClaims;
   }
@@ -71,17 +71,54 @@ async function generateReport() {
     const response = await fetch('/api/reports/today', {method:'POST'});
     if (!response.ok) throw new Error('report API unavailable');
     const data = await response.json();
-    $('reportBody').textContent = data.report?.content_markdown || '当前还没有报告。';
-    $('reportDate').textContent = data.report?.report_date || '';
+    $('reportBody').textContent = data.body_markdown || data.report?.content_markdown || '当前还没有报告。';
+    $('reportDate').textContent = data.report_date || data.report?.report_date || '';
   } catch (_) {
     const lines = ['### 今日情报报告','',`生成时间：${new Date().toLocaleString('zh-CN')}`,''];
     state.claims.forEach((c,i)=>lines.push(`#### ${i+1}. ${c.title}`,`- 分类：${c.category}`,`- 内容：${c.benefit}`,`- 证据：${c.evidence}`,`- 来源：${c.source_url}`,''));
-    $('reportBody').textContent = lines.join('\\n');
+    $('reportBody').textContent = lines.join('\n');
     $('reportDate').textContent = new Date().toISOString().slice(0,10);
+  }
+}
+function slugFromTitle(title) {
+  const ascii = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return `${ascii || 'intel-item'}-${Date.now()}`;
+}
+async function createItem(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const message = $('formMessage');
+  const formData = new FormData(form);
+  const tags = String(formData.get('tags') || '').split(',').map(tag => tag.trim()).filter(Boolean);
+  const payload = {
+    slug: slugFromTitle(String(formData.get('title') || '')),
+    title: String(formData.get('title') || '').trim(),
+    category: String(formData.get('category') || 'intel'),
+    source: String(formData.get('source') || '').trim(),
+    source_url: String(formData.get('source_url') || '').trim() || null,
+    summary: String(formData.get('summary') || '').trim(),
+    content: String(formData.get('content') || '').trim(),
+    risk_level: String(formData.get('risk_level') || 'INFO'),
+    tags
+  };
+  message.className = 'form-message';
+  message.textContent = '保存中…';
+  try {
+    const response = await fetch('/api/items', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || '保存失败');
+    message.className = 'form-message success';
+    message.textContent = '已保存，列表已刷新。';
+    form.reset();
+    await loadClaims();
+  } catch (error) {
+    message.className = 'form-message error';
+    message.textContent = error.message || '保存失败，请检查服务是否启动。';
   }
 }
 $('refreshBtn').addEventListener('click', loadClaims);
 $('reportBtn').addEventListener('click', generateReport);
+if ($('itemForm')) $('itemForm').addEventListener('submit', createItem);
 ['searchInput','categorySelect','statusSelect','riskSelect'].forEach(id => $(id).addEventListener('input', applyFilters));
 loadClaims();
 
