@@ -71,4 +71,3 @@ def test_legacy_database_gets_review_source_and_fts_migrations(
     assert {"timeout_seconds", "max_attempts", "backoff_seconds"} <= source_columns
     assert status == "pending"
     assert fts_count == 1
-
